@@ -74,11 +74,11 @@
     ".da-order-summary > div:nth-child(3), .da-context-panel, #screen-account .da-headactions, " +
     ".da-account-grid, .da-holdings .da-textbtn");
   bilingual(one(".da-status"), "模拟账户", "Simulation account");
-  bilingual(one("#screen-compare .da-pagehead p:not(.da-eyebrow)"), "比较中台提供的模拟报价与费用。", "Compare simulated venue quotes and fees from middle office.");
+  bilingual(one("#screen-compare .da-pagehead p:not(.da-eyebrow)"), "比较同一交易对的买卖报价。", "Compare venues for the same trading pair.");
   bilingual(one("#screen-trade .da-pagehead p:not(.da-eyebrow)"), "选择币种并预览或提交模拟订单。", "Select an asset, preview it, and place a simulated order.");
   bilingual(one(".da-watchlist h2"), "选择币种", "Choose an asset");
   hide(".da-watchlist .da-panelhead p");
-  bilingual(one("#screen-assistant .da-pagehead p:not(.da-eyebrow)"), "结合问卷结果、模拟行情和账户数据回答。", "Ask about your assessment, simulated quotes, or account.");
+  bilingual(one("#screen-assistant .da-pagehead p:not(.da-eyebrow)"), "结合问卷结果、行情和模拟账户回答。", "Ask about your assessment, market quotes, or simulation account.");
   bilingual(one("#screen-account .da-pagehead p:not(.da-eyebrow)"), "查看中台账本、持仓和挂单，以及 AI 风险指标。", "View the middle-office ledger, holdings, open orders, and AI risk metrics.");
   one(".da-railsummary button").addEventListener("click", () => navigate("account"));
 
@@ -90,6 +90,7 @@
   let pair = pairs[0];
   let side = "buy";
   let marketVersion = 0;
+  let marketTimer;
   const amount = one("#order-amount");
   const kind = one("#order-type");
   const limit = one("#order-limit");
@@ -102,8 +103,6 @@
   bilingual(marketColumns[1], "买入价（Ask）", "Ask");
   bilingual(marketColumns[2], "卖出价（Bid）", "Bid");
   bilingual(marketColumns[4], "报价时间（UTC）", "Quote time (UTC)");
-  bilingual(marketColumns[5], "含费总额（0.01 币）", "Total with fee (0.01 units)");
-  bilingual(one(".da-quote-panel .da-panelhead p"), "按买入 0.01 币的总成本比较。", "Ranked by total cost to buy 0.01 units.");
   bilingual(one(".da-order-note"), "确认后由中台按当时行情复核并模拟成交。", "Middle office rechecks the latest quote and executes in simulation.");
   bilingual(one(".da-precheck strong"), "中台交易前检查", "Middle-office order check");
   bilingual(one(".da-order-summary .da-summary-total span"), "估算净额", "Estimated net amount");
@@ -136,43 +135,98 @@
       option.value = quote.source;
       venue.append(option);
     }
-    if (quotes.some((quote) => quote.source === selected)) venue.value = selected;
+    if (selected && !quotes.some((quote) => quote.source === selected)) {
+      const unavailable = node("option");
+      unavailable.value = selected;
+      unavailable.disabled = true;
+      bilingual(unavailable, `${selected}（暂缺报价）`, `${selected} (quote unavailable)`);
+      venue.append(unavailable);
+    }
+    venue.value = selected;
   }
 
-  async function loadMarket(selectedVenue = "") {
+  async function loadMarket(selectedVenue = "", background = false) {
     const version = ++marketVersion;
     const symbol = pair;
     text(one(".da-quote-panel h2"), symbol);
     text(one(".da-order h2"), symbol);
     text(amount.closest("label").querySelector("b"), symbol.split("/")[0]);
-    text(one(".da-quote-pill"), "—");
-    text(one(".da-clock"), "—");
-    text(one(".da-fresh"), "—");
-    marketBody.replaceChildren();
-    setVenues([]);
-    bilingual(one(".da-order .da-panelhead p"), "模拟交易", "Simulated trading");
-    bilingual(marketNotice, "正在读取中台报价…", "Loading middle-office quotes…");
+    if (!background) {
+      text(one(".da-quote-pill"), "—");
+      text(one(".da-clock"), "—");
+      text(one(".da-fresh"), "—");
+      marketBody.replaceChildren();
+      setVenues([], selectedVenue);
+      bilingual(one(".da-order .da-panelhead p"), "模拟交易", "Simulated trading");
+      bilingual(marketNotice, "正在读取中台报价…", "Loading middle-office quotes…");
+    }
     try {
       const query = new URLSearchParams({ symbol, quantity: "0.01", side: "buy" });
       const result = await request(`/api/market/venues?${query}`);
       if (version !== marketVersion) return;
-      setVenues(result.venues, selectedVenue);
+      const publicMarket = result.market_mode === "public";
+      const preFee = result.ranking_basis === "bid_ask_excluding_fees";
+      const compareCaption = one(".da-quote-panel .da-panelhead p");
+      if (publicMarket) {
+        if (!marketTimer) {
+          marketTimer = setInterval(() => {
+            if (!document.hidden) loadMarket(venue.value, true);
+          }, 10000);
+        }
+        bilingual(marketColumns[3], "卖一挂单数量", "Best ask size");
+        bilingual(compareCaption, "比较 0.01 币的现货报价，优先列出卖一档可覆盖的平台。", "Compare quotes for 0.01 units and prioritize venues with enough at the best ask.");
+      } else {
+        bilingual(marketColumns[3], "手续费", "Fee");
+        bilingual(compareCaption, "按买入 0.01 币的报价比较。", "Compare quotes to buy 0.01 units.");
+      }
+      if (preFee) bilingual(marketColumns[5], "报价金额（未计费）", "Notional (fees excluded)");
+      else bilingual(marketColumns[5], "含费总额（0.01 币）", "Total with fee (0.01 units)");
+      if (!preview && !submitting) setVenues(result.venues, background ? venue.value : selectedVenue);
+      marketBody.replaceChildren();
       for (const quote of result.venues) {
         const select = node("button", "", "da-rowbtn");
         select.type = "button";
         bilingual(select, "选择", "Select");
         select.addEventListener("click", () => { venue.value = quote.source; invalidateOrder(); navigate("trade"); });
-        tableRow(marketBody, [quote.source, money(quote.ask, quote.quote_currency), money(quote.bid, quote.quote_currency),
-          `${(Number(quote.fee_rate) * 100).toPrecision(3)}%`, time(quote.as_of), money(quote.total, quote.quote_currency), select]);
+        const timestamp = node("span", time(quote.as_of));
+        if (quote.timestamp_source === "collected") bilingual(timestamp, `${time(quote.as_of)} · 采集`, `${time(quote.as_of)} · collected`);
+        const venueLabel = node("span", quote.source);
+        if (publicMarket) {
+          const last = node("small");
+          const price = money(quote.price, quote.quote_currency);
+          bilingual(last, `最新成交 ${price}`, `Last trade ${price}`);
+          venueLabel.append(document.createElement("br"), last);
+        }
+        const fee = quote.fee_rate === null ? "—" : `${(Number(quote.fee_rate) * 100).toPrecision(3)}%`;
+        let notional = money(preFee ? quote.notional : quote.total, quote.quote_currency);
+        if (quote.quantity_covered === false) {
+          notional = node("span");
+          bilingual(notional, "卖一档数量不足", "Insufficient at best ask");
+        }
+        tableRow(marketBody, [venueLabel, money(quote.ask, quote.quote_currency), money(quote.bid, quote.quote_currency),
+          publicMarket ? money(quote.ask_size, symbol.split("/")[0]) : fee, timestamp, notional, select]);
       }
       const latest = result.venues.map((quote) => quote.as_of).sort().at(-1);
       text(one(".da-clock"), time(latest));
-      bilingual(one(".da-fresh"), `模拟 · ${time(latest)}`, `Simulation · ${time(latest)}`);
-      if (result.venues.length) text(one(".da-quote-pill"), money(result.venues[0].price, result.venues[0].quote_currency));
-      if (result.status === "ok") bilingual(marketNotice, "模拟报价。按买卖价全量模拟成交。", "Simulated quotes. Full fills at bid or ask are assumed.");
+      if (publicMarket) bilingual(one(".da-fresh"), `公开现货 · ${time(latest)}`, `Public spot · ${time(latest)}`);
+      else bilingual(one(".da-fresh"), `模拟 · ${time(latest)}`, `Simulation · ${time(latest)}`);
+      const best = result.venues[0];
+      text(one(".da-quote-pill"), best ? money(best.price, best.quote_currency) : "—");
+      if (publicMarket) {
+        const unavailable = [...result.excluded_sources, ...result.missing_sources];
+        const details = unavailable.length ? ` · ${unavailable.join(", ")}` : "";
+        if (result.status === "ok") bilingual(marketNotice, `报价未计交易费，订单仍为模拟${details}`, `Fees excluded; simulated orders only${details}`);
+        else bilingual(marketNotice, `当前可比报价不足两家${details}`, `Fewer than two current quotes${details}`);
+      } else if (result.status === "ok") bilingual(marketNotice, "模拟报价。按买卖价全量模拟成交。", "Simulated quotes. Full fills at bid or ask are assumed.");
       else bilingual(marketNotice, "有效报价不足两家。", "Fewer than two current venues are available.");
     } catch (error) {
-      if (version === marketVersion) text(marketNotice, errorMessage(error));
+      if (version === marketVersion) {
+        marketBody.replaceChildren();
+        text(one(".da-quote-pill"), "—");
+        text(one(".da-clock"), "—");
+        text(one(".da-fresh"), "—");
+        text(marketNotice, errorMessage(error));
+      }
     }
   }
 
@@ -225,7 +279,9 @@
         preview = result;
         for (const key of ["notional", "fee", "total"]) text(one(`#order-${key}`), money(result[key], result.quote_currency));
         bilingual(submit, "确认模拟下单", "Confirm simulated order");
-        bilingual(orderNotice, `${result.source} · ${result.expires_in} 秒内确认`, `${result.source} · Confirm within ${result.expires_in}s`);
+        const feeZh = result.fee_assumed ? " · 模拟手续费按 0 计" : "";
+        const feeEn = result.fee_assumed ? " · Simulated fee assumed zero" : "";
+        bilingual(orderNotice, `${result.source} · ${result.expires_in} 秒内确认${feeZh}`, `${result.source} · Confirm within ${result.expires_in}s${feeEn}`);
       }
     } catch (error) {
       if (error.code === "preview_expired") invalidateOrder();

@@ -3,6 +3,7 @@
 ## 技术栈
 
 - 前端使用 HTML、CSS、原生 JavaScript 与本地 Lucide 图标。用 Python 3.10+ 标准库提供同源 API。
+- 五维问卷由后端用版本化题库评分。发送给中台和 AI 的内容限于派生结果，原始选择仅用于本次评分。
 - 中台和 AI 使用 Python 3.10+、标准库 HTTP 服务及各自的 SQLite。AI 支持本地 Ollama 和显式启用的 DeepSeek。
 
 ## 目录与负责人
@@ -21,7 +22,7 @@
 
 ## 常用命令
 
-- 根目录用 `python run_demo.py` 启动三个模块，用 `python -X utf8 check_integration.py` 跑 HTTP 联调。
+- 根目录用 `python run_demo.py` 启动三个模块，用 `python -X utf8 check_integration.py` 跑 HTTP 联调。两条命令加 `--live-market` 启用公开报价。
 - 在 `ai/` 或 `middle-office/` 内用 `python -m unittest discover -s tests` 跑各自的测试。
 - 根目录可用 `node --check frontend/integration.js` 检查浏览器脚本语法。
 

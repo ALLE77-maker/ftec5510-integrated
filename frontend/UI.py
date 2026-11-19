@@ -19,6 +19,7 @@ from bff import Gateway, GatewayError, JsonService, MAX_BODY
 ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PREFERRED_PORT = 5510
+STATIC_ASSETS = {"/", "/index.html", "/lucide.min.js", "/integration.js", "/questionnaire.js"}
 
 class PreviewHandler(SimpleHTTPRequestHandler):
     """Serve the prototype without cached files during iterative preview."""
@@ -29,6 +30,12 @@ class PreviewHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Cache-Control", "no-store, max-age=0")
         super().end_headers()
+
+    def send_head(self):
+        if urlsplit(self.path).path not in STATIC_ASSETS:
+            self.send_error(404)
+            return None
+        return super().send_head()
 
     def log_message(self, message_format, *args):
         print(f"[UI] {message_format % args}")
@@ -58,11 +65,8 @@ class IntegratedHandler(PreviewHandler):
             self.send_error(403)
             return None
         path = urlsplit(self.path).path
-        if path in {"/lucide.min.js", "/integration.js"}:
-            return super().send_head()
         if path not in {"/", "/index.html"}:
-            self.send_error(404)
-            return None
+            return super().send_head()
         html = (ROOT / "index.html").read_bytes().replace(b'<body>', b'<body data-integrated="true">', 1)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")

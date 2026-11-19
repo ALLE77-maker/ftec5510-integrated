@@ -8,6 +8,8 @@ from time import monotonic
 from urllib.parse import parse_qs, urlencode, urlsplit
 from uuid import uuid4
 
+from questionnaire import QuestionnaireError, assess, public_bank
+
 
 MAX_BODY = 64 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
@@ -154,6 +156,14 @@ class Gateway:
             raise GatewayError(400, "invalid_query", "Too many query parameters") from error
         if path == "/api/health" and method == "GET":
             return self._health()
+        if path == "/api/questionnaire" and method == "GET":
+            return 200, public_bank()
+        if path == "/api/questionnaire" and method == "POST":
+            try:
+                assessment = assess(body)
+            except QuestionnaireError as error:
+                raise GatewayError(422, error.code, str(error)) from error
+            return self._save_profile(assessment)
         if path == "/api/profile" and method == "GET":
             self._ensure_profile()
             return self.ai.request(method, self.profile_path)

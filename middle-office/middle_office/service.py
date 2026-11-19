@@ -15,11 +15,12 @@ DEFAULT_LIMITS = {"max_order_notional": "100000", "concentration_pct": "60", "lo
 
 
 class MiddleOffice:
-    def __init__(self, db_path, *, clock=None, max_quote_age=120, product_risks=None):
+    def __init__(self, db_path, *, clock=None, max_quote_age=120, product_risks=None, public_sources=()):
         self.store = Store(db_path)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         require(type(max_quote_age) is int and max_quote_age > 0, "invalid_config", "max_quote_age must be positive")
         self.max_quote_age = max_quote_age
+        self.public_sources = frozenset(public_sources)
         self.product_risks = product_risks or {}
         require(isinstance(self.product_risks, dict), "invalid_product_risks", "product risk map must be an object")
         require(all(pair(k) == k and type(v) is int and 1 <= v <= 5 for k, v in self.product_risks.items()),
@@ -121,6 +122,11 @@ class MiddleOffice:
                 require(assessment.get("risk_level") == f"C{level}" and assessment.get("product_cap") == f"R{level}",
                         "invalid_level", "C/R levels must agree with upstream RAI")
                 clean = {"dimensions": scores, "rai": rai, "risk_level": f"C{level}", "product_cap": f"R{level}"}
+                confidence = assessment.get("confidence")
+                if confidence is not None:
+                    require(type(confidence) in {int, float} and 0 <= confidence <= 1,
+                            "invalid_confidence", "confidence must be between 0 and 1")
+                    clean["confidence"] = confidence
                 for key in ("flags", "prohibitions"):
                     codes = assessment.get(key, [])
                     require(isinstance(codes, list) and len(codes) <= 16, "invalid_codes", "at most 16 codes")
@@ -144,8 +150,9 @@ class MiddleOffice:
                 require(band is None or isinstance(band, str) and band in {"low", "medium", "high"}, "invalid_band", "invalid wealth_band")
                 if band is not None:
                     record["dimensions"] = {"wealth_band": band}
-                account["assessment"] = record
-                self._audit(state, user, "assessment_updated", user)
+                if account["assessment"] != record:
+                    account["assessment"] = record
+                    self._audit(state, user, "assessment_updated", user)
             require(account["assessment"] is not None, "assessment_not_found", "assessment has not been supplied", 404)
             return account["assessment"]
 
@@ -153,8 +160,11 @@ class MiddleOffice:
         age = ((at or self.clock()) - timestamp(quote["as_of"])).total_seconds()
         return -15 <= age <= self.max_quote_age
 
+    def _visible_quote(self, quote):
+        return not self.public_sources or (quote["source"] in self.public_sources and "timestamp_source" in quote)
+
     def _quote(self, state, symbol, venue=None, *, at=None):
-        candidates = [q for q in state["quotes"].values() if q["symbol"] == symbol
+        candidates = [q for q in state["quotes"].values() if q["symbol"] == symbol and self._visible_quote(q)
                       and (venue is None or q["source"] == venue) and self._fresh(q, at=at)]
         require(candidates, "quote_unavailable", "no fresh quote for this pair and source", 409)
         # Valuation uses the newest source, with deterministic source tie breaking.
@@ -174,14 +184,23 @@ class MiddleOffice:
             bid = number(raw.get("bid", price), "bid", positive=True)
             ask = number(raw.get("ask", price), "ask", positive=True)
             require(bid <= ask, "crossed_quote", "bid must not exceed ask")
-            fee = number(raw.get("fee_rate", "0"), "fee_rate")
-            require(fee <= D("0.05"), "invalid_fee", "fee_rate must be between 0 and 0.05")
+            raw_fee = raw.get("fee_rate", "0")
+            fee = number(raw_fee, "fee_rate") if raw_fee is not None else None
+            require(fee is None or fee <= D("0.05"), "invalid_fee", "fee_rate must be between 0 and 0.05")
             aliases = raw.get("aliases", [])
             require(isinstance(aliases, list) and len(aliases) <= 16, "invalid_aliases", "at most 16 aliases")
-            clean.append({"symbol": symbol, "source": source, "as_of": iso(as_of), "price": amount(price),
-                          "bid": amount(bid), "ask": amount(ask), "fee_rate": amount(fee),
-                          "name": text(raw.get("name", symbol.split('/')[0]), "name", 80),
-                          "aliases": [text(alias, "alias", 80) for alias in aliases]})
+            quote = {"symbol": symbol, "source": source, "as_of": iso(as_of), "price": amount(price),
+                     "bid": amount(bid), "ask": amount(ask), "fee_rate": amount(fee) if fee is not None else None,
+                     "name": text(raw.get("name", symbol.split('/')[0]), "name", 80),
+                     "aliases": [text(alias, "alias", 80) for alias in aliases]}
+            for field in ("bid_size", "ask_size"):
+                if field in raw:
+                    quote[field] = amount(number(raw[field], field))
+            if "timestamp_source" in raw:
+                origin = raw["timestamp_source"]
+                require(origin in ("exchange", "collected"), "invalid_timestamp_source", "invalid quote timestamp basis")
+                quote["timestamp_source"] = origin
+            clean.append(quote)
         with self.store.transaction(write=True) as state:
             accepted = 0
             for quote in clean:
@@ -206,6 +225,8 @@ class MiddleOffice:
         with self.store.transaction() as state:
             matches = []
             for quote in state["quotes"].values():
+                if not self._visible_quote(quote):
+                    continue
                 terms = [quote["symbol"], quote["symbol"].split('/')[0], quote["name"], *quote["aliases"]]
                 if not key or any(key == term.casefold() for term in terms):
                     matches.append({**quote, "freshness": "fresh" if self._fresh(quote) else "stale"})
@@ -221,27 +242,41 @@ class MiddleOffice:
         symbol = pair(symbol)
         qty = number(quantity, "quantity", positive=True)
         require(isinstance(side, str) and side in {"buy", "sell"}, "invalid_side", "side must be buy or sell")
+        currency = symbol.split('/')[1]
+        bid_or_ask = "ask" if side == "buy" else "bid"
         with self.store.transaction() as state:
             venues = []
             excluded = []
             for quote in state["quotes"].values():
-                if quote["symbol"] != symbol:
+                if quote["symbol"] != symbol or not self._visible_quote(quote):
                     continue
                 if not self._fresh(quote):
                     excluded.append(quote["source"])
                     continue
-                price = D(quote["ask"] if side == "buy" else quote["bid"])
+                price = D(quote[bid_or_ask])
                 value = qty * price
-                fee = D(amount(value * D(quote["fee_rate"])))
-                total = D(amount(value)) + fee if side == "buy" else D(amount(value)) - fee
-                venues.append({**quote, "execution_price": amount(price), "fee": amount(fee),
-                               "total": amount(total), "quote_currency": symbol.split('/')[1]})
-            venues.sort(key=lambda q: (D(q["total"]), q["source"]), reverse=side == "sell")
+                rate = quote["fee_rate"]
+                fee = D(amount(value * D(rate))) if rate is not None else None
+                net = amount(D(amount(value)) + (fee if side == "buy" else -fee)) if fee is not None else None
+                size = quote.get(bid_or_ask + "_size")
+                venues.append({**quote, "execution_price": amount(price), "fee": amount(fee) if fee is not None else None,
+                               "total": net, "quote_currency": currency, "notional": amount(value),
+                               "quantity_covered": qty <= D(size) if size is not None else None})
+            pre_fee = bool(self.public_sources) or any(q["fee_rate"] is None for q in venues)
+            if pre_fee:
+                direction = 1 if side == "buy" else -1
+                venues.sort(key=lambda q: (q["quantity_covered"] is False, direction * D(q["execution_price"]), q["source"]))
+            else:
+                venues.sort(key=lambda q: (D(q["total"]), q["source"]), reverse=side == "sell")
+            eligible = [q for q in venues if q["quantity_covered"] is not False]
+            missing = self.public_sources - {q["source"] for q in venues} - set(excluded)
             return {"symbol": symbol, "side": side, "quantity": amount(qty), "mode": "simulation",
-                    "venues": venues, "excluded_sources": excluded,
+                    "market_mode": "public" if self.public_sources else "simulation",
+                    "venues": venues, "excluded_sources": sorted(excluded), "missing_sources": sorted(missing),
                     "status": "ok" if len(venues) >= 2 else "insufficient_sources",
-                    "recommended_source": venues[0]["source"] if len(venues) >= 2 else None,
-                    "slippage_model": "none_full_fill_at_bid_ask"}
+                    "recommended_source": eligible[0]["source"] if len(eligible) >= 2 else None,
+                    "ranking_basis": "bid_ask_excluding_fees" if pre_fee else "total_with_fees",
+                    "slippage_model": "top_of_book_only" if self.public_sources else "none_full_fill_at_bid_ask"}
 
     def _reserved(self, state, user, currency=None, symbol=None, exclude=None):
         result = D(0)
@@ -279,7 +314,7 @@ class MiddleOffice:
         require(notional >= D("0.00000001"), "order_too_small", "notional is below the ledger precision", 409)
         require(notional <= D(account["limits"]["max_order_notional"]), "order_limit", "order exceeds configured notional limit", 409)
         currency = symbol.split('/')[1]
-        fee = D(amount(notional * D(quote["fee_rate"])))
+        fee = D(amount(notional * D(quote["fee_rate"] or "0")))
         value = D(amount(notional))
         if side == "buy":
             total = value + fee
@@ -292,7 +327,8 @@ class MiddleOffice:
             require(available >= qty, "insufficient_position", "insufficient available position", 409)
         return {"source": quote["source"], "as_of": quote["as_of"], "fee_rate": quote["fee_rate"],
                 "quote_currency": currency, "reference_price": amount(price),
-                "notional": amount(value), "fee": amount(fee), "total": amount(total)}
+                "notional": amount(value), "fee": amount(fee), "total": amount(total),
+                "fee_assumed": quote["fee_rate"] is None}
 
     def preview_order(self, user, payload):
         terms = self._order_terms(payload)
@@ -319,7 +355,7 @@ class MiddleOffice:
                      "fingerprint": fingerprint, "created_at": iso(self.clock()), "updated_at": iso(self.clock())}
             try:
                 quote = self._order_quote(state, account, terms)
-                order.update(source=quote["source"], fee_rate=quote["fee_rate"])
+                order.update(source=quote["source"], fee_rate=quote["fee_rate"] or "0")
                 estimate = self._check_order(state, account, user, terms, quote)
                 if terms["side"] == "buy":
                     order["reserved_cash"] = estimate["total"]
@@ -348,12 +384,17 @@ class MiddleOffice:
 
     def _execution_quote(self, state, order):
         candidates = [q for q in state["quotes"].values() if q["symbol"] == order["symbol"]
-                      and (order["source"] is None or q["source"] == order["source"]) and self._fresh(q)]
+                      and self._visible_quote(q) and self._fresh(q)
+                      and (order["source"] is None or q["source"] == order["source"])]
         require(candidates, "quote_unavailable", "no fresh execution quote", 409)
         buy = order["side"] == "buy"
+        if self.public_sources and order["order_type"] == "market":
+            size_key = "ask_size" if buy else "bid_size"
+            candidates = [q for q in candidates if D(q.get(size_key, "0")) >= D(order["quantity"])]
+            require(candidates, "insufficient_top_size", "top of book cannot cover the simulated quantity", 409)
         def total(q):
             px = D(q["ask"] if buy else q["bid"])
-            fee = D(q["fee_rate"])
+            fee = D(q["fee_rate"] or "0")
             return px * (1 + fee if buy else 1 - fee)
         return sorted(candidates, key=lambda q: (total(q) if buy else -total(q), q["source"]))[0]
 
@@ -372,6 +413,8 @@ class MiddleOffice:
         except BusinessError:
             return
         qty = D(order["quantity"])
+        if self.public_sources and qty > D(quote.get("ask_size" if order["side"] == "buy" else "bid_size", "0")):
+            return
         price = D(quote["ask"] if order["side"] == "buy" else quote["bid"])
         limit = D(order["limit_price"]) if order["limit_price"] else None
         if limit and ((order["side"] == "buy" and price > limit) or (order["side"] == "sell" and price < limit)):

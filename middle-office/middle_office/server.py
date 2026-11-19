@@ -77,7 +77,10 @@ class Handler(BaseHTTPRequestHandler):
         url = urlsplit(self.path)
         path, method = unquote(url.path), self.command
         if (method, path) == ("GET", "/health"):
-            return 200, {"status": "ok", "mode": "simulation", "modules": 6, "api_version": 1}
+            feed = getattr(self.server, "public_feed", None)
+            return 200, {"status": "ok", "mode": "simulation", "modules": 6, "api_version": 1,
+                         "market_mode": "public" if self.server.office.public_sources else "simulation",
+                         "public_sources": feed.snapshot() if feed else {}}
         self._authorize(path)
         office = self.server.office
         params = parse_qs(url.query, keep_blank_values=True)
