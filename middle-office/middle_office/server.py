@@ -99,6 +99,8 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, getattr(office, action)(user)
             if method == "PUT" and action in {"preferences", "assessment"}:
                 return 200, getattr(office, action)(user, self._body())
+            if (method, action) == ("POST", "orders/preview"):
+                return 200, office.preview_order(user, self._body())
             if action == "orders":
                 if method == "POST":
                     return 200, office.place_order(user, self._body())

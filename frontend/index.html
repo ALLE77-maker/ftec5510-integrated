@@ -25,6 +25,14 @@
     }
   </style>
   <script defer src="./lucide.min.js"></script>
+  <script defer src="./integration.js"></script>
+  <style>
+    body[data-integrated] [hidden] { display: none !important; }
+    body[data-integrated] .da-dashboard-grid,
+    body[data-integrated] .da-chat-layout { grid-template-columns: minmax(0, 1fr); }
+    body[data-integrated] .da-bubble { white-space: pre-wrap; overflow-wrap: anywhere; }
+    body[data-integrated] .da-integration-notice { padding: 12px 16px; margin: 0; }
+  </style>
 </head>
 <body>
 <div id="digital-asset-ui" class="da-app" aria-label="多平台数字资产投资台 UI 原型">
@@ -343,9 +351,9 @@
               <label class="da-field">
                 <span>订单类型</span>
                 <div class="da-selectwrap">
-                  <select>
-                    <option>限价单</option>
-                    <option>市价单</option>
+                  <select id="order-type">
+                    <option value="limit">限价单</option>
+                    <option value="market">市价单</option>
                   </select>
                   <i data-lucide="chevron-down" aria-hidden="true"></i>
                 </div>
@@ -363,7 +371,7 @@
               <label class="da-field">
                 <span>限价</span>
                 <div class="da-inputwrap">
-                  <input type="text" value="68,420.10" inputmode="decimal">
+                  <input id="order-limit" type="text" value="68,420.10" inputmode="decimal">
                   <b>US$</b>
                 </div>
               </label>
@@ -2887,6 +2895,7 @@
 
     languageToggle?.addEventListener("click", () => {
       applyLanguage(currentLanguage === "zh" ? "en" : "zh");
+      document.dispatchEvent(new Event("harbor-language"));
     });
 
     const navButtons = Array.from(root.querySelectorAll("[data-screen-target]"));
@@ -2928,6 +2937,7 @@
     });
 
     const amount = root.querySelector("#order-amount");
+    const integrated = document.body.dataset.integrated === "true";
     const notional = root.querySelector("#order-notional");
     const fee = root.querySelector("#order-fee");
     const total = root.querySelector("#order-total");
@@ -2941,6 +2951,7 @@
     }
 
     function updateOrder() {
+      if (integrated) return;
       const quantity = Math.max(0, Number(amount?.value || 0));
       const base = quantity * price;
       const feeValue = base * 0.002;
@@ -2970,6 +2981,7 @@
 
     root.querySelector("#assistant-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (integrated) return;
       if (!assistantInput || !assistantInput.value.trim()) return;
       assistantInput.value = "";
       assistantInput.dataset.dynamicPlaceholder = "recorded";
@@ -2977,6 +2989,7 @@
     });
 
     root.querySelector("#submit-order")?.addEventListener("click", (event) => {
+      if (integrated) return;
       const button = event.currentTarget;
       button.dataset.i18nSource = "已进入订单确认 · 原型演示";
       button.textContent = translateText(button.dataset.i18nSource);

@@ -83,6 +83,10 @@ def validate_chat(payload):
     return message.strip(), history, [query.strip() for query in queries], include_account, include_simulation
 
 
+def is_demo_quote(source):
+    return source == "demo" or source.startswith("demo:")
+
+
 def mentions_account(message):
     return any(term in message.casefold() for term in ACCOUNT_TERMS)
 
@@ -165,7 +169,7 @@ class Assistant:
                 if quote["freshness"] == "fresh":
                     fresh_quotes[quote["symbol"]] = {
                         **{key: quote[key] for key in ("symbol", "price", "as_of")},
-                        "demo": quote["source"] == "demo",
+                        "demo": is_demo_quote(quote["source"]),
                     }
         lesson = next((text for terms, text in KNOWLEDGE if any(term in lower for term in terms)), None)
         account_context = None
@@ -297,7 +301,7 @@ class Assistant:
                 continue
             seen.add(symbol)
             if quote["freshness"] == "fresh":
-                label = "模拟报价" if quote["source"] == "demo" else "行情快照"
+                label = "模拟报价" if is_demo_quote(quote["source"]) else "行情快照"
                 facts.append(f"{label} · {symbol} {quote['price']} · {quote['as_of']} · 来源 {quote['source']}。")
             else:
                 reason = "时间戳异常" if quote["freshness"] == "future" else "报价已过期"
@@ -309,6 +313,11 @@ class Assistant:
             if account["positions"]:
                 positions = "、".join(f"{row['symbol']} {row['quantity']}" for row in account["positions"][:5])
                 facts.append(f"持仓摘要 · {positions}。")
+            if account["open_orders"]:
+                directions = {"buy": "买入", "sell": "卖出"}
+                orders = "、".join(f"{row['symbol']} {directions[row['side']]} {row['quantity']}"
+                                 for row in account["open_orders"][:5])
+                facts.append(f"挂单摘要 · {orders}。")
         elif account:
             facts.append("当前无法读取账户快照，持仓和挂单状态未知。")
         return facts

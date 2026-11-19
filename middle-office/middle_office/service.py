@@ -254,9 +254,7 @@ class MiddleOffice:
                 result += D(order["quantity"])
         return result
 
-    def place_order(self, user, payload):
-        identifier(user)
-        request_id = identifier(payload.get("request_id"), "request_id")
+    def _order_terms(self, payload):
         symbol = pair(payload.get("symbol"))
         side = payload.get("side")
         kind = payload.get("order_type", "market")
@@ -267,37 +265,64 @@ class MiddleOffice:
         venue = payload.get("source")
         if venue is not None:
             venue = text(venue, "source", 64)
-        fingerprint = json.dumps([symbol, side, kind, amount(qty), amount(limit) if limit else None, venue])
+        return {"symbol": symbol, "side": side, "order_type": kind, "quantity": amount(qty),
+                "limit_price": amount(limit) if limit else None, "source": venue}
+
+    def _order_quote(self, state, account, terms):
+        self._check_suitability(account, terms)
+        return self._execution_quote(state, terms)
+
+    def _check_order(self, state, account, user, terms, quote):
+        qty, side, symbol = D(terms["quantity"]), terms["side"], terms["symbol"]
+        price = D(terms["limit_price"] or quote["ask" if side == "buy" else "bid"])
+        notional = qty * price
+        require(notional >= D("0.00000001"), "order_too_small", "notional is below the ledger precision", 409)
+        require(notional <= D(account["limits"]["max_order_notional"]), "order_limit", "order exceeds configured notional limit", 409)
+        currency = symbol.split('/')[1]
+        fee = D(amount(notional * D(quote["fee_rate"])))
+        value = D(amount(notional))
+        if side == "buy":
+            total = value + fee
+            available = D(account["balances"].get(currency, "0")) - self._reserved(state, user, currency=currency)
+            require(available >= total, "insufficient_balance", "insufficient available quote currency", 409)
+        else:
+            total = value - fee
+            held = D(account["positions"].get(symbol, {}).get("quantity", "0"))
+            available = held - self._reserved(state, user, symbol=symbol)
+            require(available >= qty, "insufficient_position", "insufficient available position", 409)
+        return {"source": quote["source"], "as_of": quote["as_of"], "fee_rate": quote["fee_rate"],
+                "quote_currency": currency, "reference_price": amount(price),
+                "notional": amount(value), "fee": amount(fee), "total": amount(total)}
+
+    def preview_order(self, user, payload):
+        terms = self._order_terms(payload)
+        with self.store.transaction() as state:
+            account = self._account(state, user)
+            quote = self._order_quote(state, account, terms)
+            estimate = self._check_order(state, account, user, terms, quote)
+        return {**terms, **estimate, "mode": "simulation"}
+
+    def place_order(self, user, payload):
+        identifier(user)
+        request_id = identifier(payload.get("request_id"), "request_id")
+        terms = self._order_terms(payload)
+        fingerprint = json.dumps([terms[key] for key in
+                                  ("symbol", "side", "order_type", "quantity", "limit_price", "source")])
         with self.store.transaction(write=True) as state:
             account = self._account(state, user)
             previous = next((o for o in state["orders"].values() if o["user_id"] == user and o["request_id"] == request_id), None)
             if previous:
                 require(previous["fingerprint"] == fingerprint, "request_conflict", "request_id reused with different input", 409)
                 return self._public_order(previous)
-            order = {"order_id": "ord_" + uuid.uuid4().hex, "user_id": user, "request_id": request_id,
-                     "symbol": symbol, "side": side, "order_type": kind, "quantity": amount(qty),
-                     "limit_price": amount(limit) if limit else None, "source": venue,
+            order = {"order_id": "ord_" + uuid.uuid4().hex, "user_id": user, "request_id": request_id, **terms,
                      "status": "open", "reserved_cash": "0", "reason": None,
                      "fingerprint": fingerprint, "created_at": iso(self.clock()), "updated_at": iso(self.clock())}
             try:
-                self._check_suitability(account, order)
-                quote = self._execution_quote(state, order)
-                order["source"] = quote["source"]
-                order["fee_rate"] = quote["fee_rate"]
-                price = limit or D(quote["ask"] if side == "buy" else quote["bid"])
-                notional = qty * price
-                require(notional >= D("0.00000001"), "order_too_small", "notional is below the ledger precision", 409)
-                require(notional <= D(account["limits"]["max_order_notional"]), "order_limit", "order exceeds configured notional limit", 409)
-                base, currency = symbol.split('/')
-                if side == "buy":
-                    reserve = D(amount(notional)) + D(amount(notional * D(quote["fee_rate"])))
-                    available = D(account["balances"].get(currency, "0")) - self._reserved(state, user, currency=currency)
-                    require(available >= reserve, "insufficient_balance", "insufficient available quote currency", 409)
-                    order["reserved_cash"] = amount(reserve)
-                else:
-                    held = D(account["positions"].get(symbol, {}).get("quantity", "0"))
-                    available = held - self._reserved(state, user, symbol=symbol)
-                    require(available >= qty, "insufficient_position", "insufficient available position", 409)
+                quote = self._order_quote(state, account, terms)
+                order.update(source=quote["source"], fee_rate=quote["fee_rate"])
+                estimate = self._check_order(state, account, user, terms, quote)
+                if terms["side"] == "buy":
+                    order["reserved_cash"] = estimate["total"]
             except BusinessError as error:
                 order["status"], order["reason"] = "rejected", error.code
             state["orders"][order["order_id"]] = order
