@@ -31,14 +31,17 @@
   const money = (amount, currency) => amount == null ? "—" : `${amount} ${currency}`;
   const time = (timestamp) => timestamp ? timestamp.replace("T", " ").replace(/\.\d+Z$/, "Z") : "—";
   const errorMessage = (error) => error.message || "Request failed";
+  const accountName = document.body.dataset.accountName;
 
   async function request(path, method = "GET", payload) {
     const options = { method, headers: { Accept: "application/json" } };
+    if (accountName) options.headers["X-Harbor-Account"] = accountName;
     if (payload !== undefined) {
       options.headers["Content-Type"] = "application/json";
       options.body = JSON.stringify(payload);
     }
     const response = await fetch(path, options);
+    if (accountName && response.status === 401) location.reload();
     const data = await response.json();
     if (!response.ok) {
       const error = new Error(data.error?.message || `HTTP ${response.status}`);
@@ -67,7 +70,78 @@
     all("[data-demo-zh]").forEach((element) => bilingual(element, element.dataset.demoZh, element.dataset.demoEn));
   });
 
-  hide(".da-topmeta .da-iconbtn, .da-avatar, #screen-compare .da-kpis, .da-route-panel, .da-crossasset, " +
+  window.addEventListener("pageshow", (event) => { if (event.persisted) location.reload(); });
+  hide(".da-topmeta .da-iconbtn, .da-avatar");
+  if (!accountName) {
+    const input = one("#account-name");
+    const submit = one("#account-login-submit");
+    const status = one("#account-login-status");
+    bilingual(one("#account-login-eyebrow"), "本机演示", "LOCAL DEMO");
+    bilingual(one("#account-login-title"), "登录演示账户", "Sign in to a demo account");
+    bilingual(one("#account-login-description"), "输入账户名继续。首次使用该名称时会自动创建模拟账户。",
+      "Enter an account name to continue. A new name creates a simulation account.");
+    bilingual(one('label[for="account-name"]'), "账户名", "Account name");
+    bilingual(one("#account-login-hint"), "可用英文字母、数字、下划线和连字符，最多 64 个字符。",
+      "Up to 64 letters (A–Z), digits, underscores or hyphens.");
+    bilingual(one(".da-login-note"), "仅用于模拟，不验证身份。请勿输入真实账号或密码。",
+      "Simulation only. Identity is not verified. Do not enter real credentials.");
+    bilingual(submit, "登录", "Sign in");
+    input.addEventListener("input", () => {
+      input.removeAttribute("aria-invalid");
+      text(status, "");
+    });
+    one("#account-login-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (submit.disabled) return;
+      const name = input.value.trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+        input.setAttribute("aria-invalid", "true");
+        bilingual(status, "请输入有效的账户名。", "Enter a valid account name.");
+        input.focus();
+        return;
+      }
+      submit.disabled = true;
+      input.readOnly = true;
+      text(status, "");
+      bilingual(submit, "正在登录…", "Signing in…");
+      try {
+        await request("/api/session", "POST", { account_name: name });
+        location.reload();
+      } catch (error) {
+        if (error.code === "invalid_account_name") {
+          input.setAttribute("aria-invalid", "true");
+          bilingual(status, "请输入有效的账户名。", "Enter a valid account name.");
+        } else {
+          bilingual(status, "暂时无法打开演示账户，请重试。", "Could not open the demo account. Try again.");
+        }
+        submit.disabled = false;
+        input.readOnly = false;
+        bilingual(submit, "登录", "Sign in");
+        input.focus();
+      }
+    });
+    return;
+  }
+
+  const switchAccount = one("#account-switch");
+  const switchStatus = one("#account-switch-status");
+  text(one("#current-account"), accountName);
+  one("#current-account").title = accountName;
+  bilingual(switchAccount, "切换账户", "Switch account");
+  switchAccount.addEventListener("click", async () => {
+    switchAccount.disabled = true;
+    switchStatus.hidden = true;
+    try {
+      await request("/api/session", "DELETE");
+      location.reload();
+    } catch {
+      bilingual(switchStatus, "暂时无法切换账户，请重试。", "Could not switch accounts. Try again.");
+      switchStatus.hidden = false;
+      switchAccount.disabled = false;
+    }
+  });
+
+  hide("#screen-compare .da-kpis, .da-route-panel, .da-crossasset, " +
     ".da-segmented, .da-quote-panel .da-textbtn, .da-quote-panel .da-footnote, " +
     "#screen-compare .da-headactions .da-primary, #screen-trade .da-headactions, .da-watchlist .da-iconbtn, " +
     ".da-watchlist-head, .da-watchfoot, .da-watchrow > :not(.da-asset), .da-quickamounts, " +

@@ -15,6 +15,12 @@
 
 ## 2. 浏览器与 BFF
 
+### 本机演示账户
+
+- `POST /api/session` 接收 `{"account_name":"student_demo"}`。名称去除首尾空白后必须为 1–64 个英文字母、数字、下划线或连字符，区分大小写。若账户不存在则创建模拟账本；返回当前 `account_name` 并设置有效期 8 小时的 `HttpOnly; SameSite=Strict` 会话 Cookie。
+- `GET /api/session` 返回当前 `account_name`（未登录时为 `null`）；`DELETE /api/session` 使当前会话失效并清除 Cookie。除健康检查和会话路由外，BFF 依据会话选择账户，未登录返回 `401`。
+- 页面发送 `X-Harbor-Account` 仅检测其他标签页是否已切换账户；该字段不能授予访问权限。此流程是本机模拟账户选择，不验证账号所有权，也不应对公网开放。
+
 ### 服务状态
 
 ```http

@@ -2,12 +2,37 @@
 
 import argparse
 from decimal import Decimal
+from http.cookiejar import CookieJar
+import json
 from time import monotonic, sleep
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
-from run_demo import ASSESSMENT, USER, demo_stack
+from run_demo import ASSESSMENT, demo_stack
+
+
+USER = "student_demo"
+
+
+class BrowserClient:
+    def __init__(self, url):
+        self.url = url
+        self.cookies = CookieJar()
+        self.opener = build_opener(HTTPCookieProcessor(self.cookies))
+
+    def request(self, method, path, body=None, *, headers=None):
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        request = Request(self.url + path, method=method, data=data, headers=headers or {})
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            response = self.opener.open(request, timeout=12)
+        except HTTPError as error:
+            response = error
+        with response:
+            payload = json.load(response) if response.headers.get_content_type() == "application/json" else response.read()
+            return response.status, payload
 
 
 def checked(client, method, path, body=None, *, expected=200):
@@ -19,7 +44,8 @@ def checked(client, method, path, body=None, *, expected=200):
 
 def check_html(url):
     with urlopen(url, timeout=5) as page:
-        assert b'<body data-integrated="true">' in page.read()
+        html = page.read()
+        assert b'<body data-integrated="true">' in html and b'id="account-login-form"' in html
     with urlopen(url + "/integration.js", timeout=5) as script:
         assert b"/api/assistant/chat" in script.read()
     for private_file in ("/.env.example", "/question-bank.json"):
@@ -35,6 +61,53 @@ def check_html(url):
         assert error.code == 403
     else:
         raise AssertionError("the demo accepted a foreign origin")
+
+
+def check_sign_in(ui):
+    assert checked(ui, "GET", "/api/session") == {"account_name": None}
+    for path in ("/api/account/summary", "/api/profile", "/api/orders"):
+        assert checked(ui, "GET", path, expected=401)["error"]["code"] == "sign_in_required"
+    assert checked(ui, "POST", "/api/session", {"account_name": "../no"}, expected=400)["error"]["code"] == "invalid_account_name"
+    assert checked(ui, "POST", "/api/session", {"account_name": f" {USER} "}) == {"account_name": USER}
+    assert checked(ui, "GET", "/api/session") == {"account_name": USER}
+    cookie = next(iter(ui.cookies))
+    assert "HttpOnly" in cookie._rest and cookie._rest["SameSite"] == "Strict" and cookie.value != USER
+    assert f'data-account-name="{USER}"'.encode("ascii") in checked(ui, "GET", "/")
+
+
+def check_account_switch(ui, url):
+    buy = {"symbol": "BTC/USDT", "side": "buy", "quantity": "0.01", "order_type": "market"}
+    preview = checked(ui, "POST", "/api/orders/preview", buy)
+    first_orders = checked(ui, "GET", "/api/orders")["orders"]
+    first_ledger = checked(ui, "GET", "/api/account/summary")
+    first_profile = checked(ui, "GET", "/api/profile")
+    first_cookie = next(iter(ui.cookies))
+    other = BrowserClient(url)
+    second_name = "student_second"
+    checked(other, "GET", "/api/account/summary", expected=401)
+    assert checked(other, "POST", "/api/session", {"account_name": second_name})["account_name"] == second_name
+    assert checked(ui, "GET", "/api/session")["account_name"] == USER
+    assert checked(ui, "DELETE", "/api/session") == {"account_name": None}
+    replay = BrowserClient(url)
+    replay.cookies.set_cookie(first_cookie)
+    checked(replay, "GET", "/api/account/summary", expected=401)
+    checked(ui, "GET", "/api/account/summary", expected=401)
+    checked(ui, "POST", "/api/session", {"account_name": second_name})
+    status, payload = ui.request("POST", "/api/orders/preview", buy, headers={"X-Harbor-Account": USER})
+    assert status == 401 and payload["error"]["code"] == "session_changed"
+    assert checked(ui, "GET", "/api/orders")["orders"] == []
+    assert checked(ui, "GET", "/api/account/summary")["portfolio"]["balances"] != first_ledger["portfolio"]["balances"]
+    checked(ui, "GET", "/api/profile", expected=404)
+    assert checked(ui, "POST", "/api/orders", {"preview_id": preview["preview_id"]}, expected=409)["error"]["code"] == "preview_expired"
+    second_chat = checked(ui, "POST", "/api/assistant/chat", {
+        "user_id": USER, "message": "查看我的持仓和挂单", "include_account": True,
+    })
+    assert second_chat["account"]["state"] == "ok"
+    assert {"symbol": "BTC", "quantity": "0.1"} in second_chat["account"]["positions"]
+    checked(ui, "POST", "/api/session", {"account_name": USER})
+    assert checked(ui, "GET", "/api/orders")["orders"] == first_orders
+    assert checked(ui, "GET", "/api/account/summary")["portfolio"]["balances"] == first_ledger["portfolio"]["balances"]
+    assert checked(ui, "GET", "/api/profile") == first_profile
 
 
 def questionnaire_form(ui, middle, ai):
@@ -112,12 +185,16 @@ def trade(ui):
 
 
 def offline_checks():
-    with demo_stack(ui_port=0) as (ui, middle, ai, reader, url):
+    with demo_stack(ui_port=0) as (middle, ai, reader, url):
+        ui = BrowserClient(url)
         check_html(url)
         health = checked(ui, "GET", "/api/health")
         assert set(health["services"]) == {"middle_office", "ai"}
         assert not health["services"]["ai"]["remote_model_configured"]
         print("PASS frontend assets, loopback origin, and both backend health checks")
+
+        check_sign_in(ui)
+        print("PASS account-name sign-in, session cookie, and anonymous access check")
 
         questionnaire_form(ui, middle, ai)
         print("PASS original 30 questions, example RAI 61/C3/R3, incomplete answers, leverage cap and AI follow-up")
@@ -161,11 +238,16 @@ def offline_checks():
         checked(reader, "POST", f"/api/accounts/{USER}/orders/preview", {}, expected=403)
         print("PASS account snapshot, AI risk, order cancellation, and read-only AI permissions")
 
+        check_account_switch(ui, url)
+        print("PASS logout, account switching, isolated balances, profiles, orders, previews and AI context")
+
 
 def live_checks():
     pairs = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
-    with demo_stack(ui_port=0, live_market=True) as (ui, middle, ai, _, url):
+    with demo_stack(ui_port=0, live_market=True) as (middle, ai, _, url):
+        ui = BrowserClient(url)
         check_html(url)
+        check_sign_in(ui)
         questionnaire_form(ui, middle, ai)
         deadline = monotonic() + 22
         for symbol in pairs:

@@ -34,6 +34,48 @@
     body[data-integrated] .da-chat-layout { grid-template-columns: minmax(0, 1fr); }
     body[data-integrated] .da-bubble { white-space: pre-wrap; overflow-wrap: anywhere; }
     body[data-integrated] .da-integration-notice { padding: 12px 16px; margin: 0; }
+    body:not([data-integrated]) .da-sign-in,
+    body:not([data-integrated]) .da-session-controls,
+    body[data-account-name] .da-sign-in,
+    body[data-integrated]:not([data-account-name]) :is(.da-shell, .da-session-controls, .da-status, .da-clock) {
+      display: none;
+    }
+    .da-sign-in {
+      display: grid;
+      place-items: center;
+      min-height: min(620px, 78vh);
+      padding: 36px 16px;
+      background: radial-gradient(ellipse at top, var(--da-brand-soft), transparent 75%);
+    }
+    .da-sign-in .da-sign-in-card {
+      width: min(100%, 420px);
+      display: grid;
+      gap: 16px;
+      padding: clamp(20px, 5vw, 36px);
+      box-shadow: var(--da-shadow);
+    }
+    .da-sign-in-card form { display: grid; gap: 8px; }
+    .da-sign-in-card label { font-weight: 650; }
+    .da-sign-in-card input {
+      width: 100%;
+      min-height: 44px;
+      padding: 10px 12px;
+      border: 1px solid var(--da-line);
+      border-radius: 9px;
+      background: var(--da-surface-2);
+      color: var(--da-ink);
+    }
+    #account-login-submit { min-height: 44px; margin-top: 8px; }
+    #account-login-submit:disabled, #account-switch:disabled { opacity: .65; }
+    #account-login-hint, .da-sign-in-card .da-login-note { color: var(--da-muted); font-size: 12px; }
+    #account-login-status:not(:empty), #account-switch-status:not(:empty) { color: var(--da-negative); }
+    .da-session-controls { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .da-session-controls > strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 24ch; }
+    .da-session-controls > button { white-space: nowrap; }
+    @media (max-width: 560px) {
+      body[data-account-name] .da-topbar { flex-wrap: wrap; }
+      .da-session-controls > strong { max-width: 16ch; }
+    }
     .da-question-panel { padding: 20px; max-width: 820px; }
     .da-question-panel fieldset { border: 0; padding: 0; margin: 20px 0; }
     .da-question-panel legend { margin-bottom: 8px; font-weight: 650; }
@@ -55,6 +97,10 @@
     <div class="da-topmeta">
       <span class="da-status"><i data-lucide="shield-check" aria-hidden="true"></i> KYC 已完成 · 专业投资者</span>
       <span class="da-clock">行情更新 14:32:08 HKT</span>
+      <div class="da-session-controls">
+        <strong id="current-account"></strong>
+        <button class="da-secondary" id="account-switch" type="button">切换账户</button>
+      </div>
       <button class="da-langtoggle" id="language-toggle" type="button" aria-label="Switch to Chinese">
         <i data-lucide="languages" aria-hidden="true"></i>
         <span>中文</span>
@@ -65,6 +111,24 @@
       <div class="da-avatar" aria-label="用户 Leo">LL</div>
     </div>
   </header>
+
+  <main class="da-sign-in" aria-labelledby="account-login-title">
+    <article class="da-panel da-sign-in-card">
+      <p class="da-eyebrow" id="account-login-eyebrow">本机演示</p>
+      <h1 id="account-login-title">登录演示账户</h1>
+      <p id="account-login-description">输入账户名继续。首次使用该名称时会自动创建模拟账户。</p>
+      <form id="account-login-form" method="post" action="/api/session">
+        <label for="account-name">账户名</label>
+        <input id="account-name" name="account_name" type="text" autocomplete="username" autocapitalize="none"
+          spellcheck="false" maxlength="64" required placeholder="student_demo"
+          aria-describedby="account-login-hint account-login-status">
+        <small id="account-login-hint">可用英文字母、数字、下划线和连字符，最多 64 个字符。</small>
+        <button class="da-primary" id="account-login-submit" type="submit">登录</button>
+        <p id="account-login-status" role="status"></p>
+      </form>
+      <p class="da-login-note">仅用于模拟，不验证身份。请勿输入真实账号或密码。</p>
+    </article>
+  </main>
 
   <div class="da-shell">
     <aside class="da-rail" aria-label="主导航">
@@ -99,6 +163,7 @@
     </aside>
 
     <main class="da-main">
+      <p id="account-switch-status" class="da-integration-notice" role="status" hidden></p>
       <section class="da-screen" id="screen-questionnaire" aria-labelledby="questionnaire-title" hidden>
         <div class="da-pagehead">
           <div><h1 id="questionnaire-title">风险问卷</h1></div>
@@ -2916,6 +2981,9 @@
 
     languageToggle?.addEventListener("click", () => {
       applyLanguage(currentLanguage === "zh" ? "en" : "zh");
+      if (document.body.dataset.integrated === "true") {
+        try { localStorage.setItem("harbor-language", currentLanguage); } catch {}
+      }
       document.dispatchEvent(new Event("harbor-language"));
     });
 
@@ -3016,7 +3084,11 @@
       button.textContent = translateText(button.dataset.i18nSource);
     });
 
-    applyLanguage("en");
+    let preferredLanguage = "en";
+    if (integrated) {
+      try { preferredLanguage = localStorage.getItem("harbor-language") ?? preferredLanguage; } catch {}
+    }
+    applyLanguage(preferredLanguage);
   })();
 </script>
 <script>

@@ -1,8 +1,9 @@
-"""Same-origin gateway for one local Harbor Invest demo account."""
+"""Same-origin gateway and account selection for the local Harbor Invest demo."""
 
 import json
 import re
 from http.client import HTTPConnection, HTTPSConnection, HTTPException
+from secrets import token_urlsafe
 from threading import Lock
 from time import monotonic
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -14,6 +15,8 @@ from questionnaire import QuestionnaireError, assess, public_bank
 MAX_BODY = 64 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
 PREVIEW_TTL = 60
+SESSION_TTL = 8 * 60 * 60
+ACCOUNT_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ORDER_ID = re.compile(r"ord_[a-f0-9]{32}")
 
 
@@ -62,19 +65,15 @@ def query_string(params, *names):
     return "?" + urlencode(selected) if selected else ""
 
 
-class Gateway:
-    def __init__(self, ai, middle, user_id):
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user_id):
-            raise ValueError("invalid demo account identifier")
-        self.ai, self.middle, self.user_id = ai, middle, user_id
-        self.account_path = "/api/accounts/" + user_id
-        self.profile_path = "/v1/profiles/" + user_id
-        self.profile_lock = Lock()
-        self.synced_assessment = None
-        self.preview_lock = Lock()
-        self.previews = {}
+class DemoSessions:
+    def __init__(self, ai, middle, *, account_seed=None):
+        self.ai, self.middle = ai, middle
+        self.account_seed = account_seed if account_seed is not None else {}
+        self.lock = Lock()
+        self.accounts = {}
+        self.sessions = {}
 
-    def _health(self):
+    def health(self):
         services = {}
         for client in (self.ai, self.middle):
             try:
@@ -85,6 +84,48 @@ class Gateway:
         ok = all(service.get("status") == "ok" for service in services.values())
         return (200 if ok else 503), {"status": "ok" if ok else "partial", "mode": "simulation",
                                      "services": services}
+
+    def sign_in(self, body, previous_token):
+        name = body.get("account_name")
+        if not isinstance(name, str) or not ACCOUNT_NAME.fullmatch(name.strip()):
+            raise GatewayError(400, "invalid_account_name", "Use 1–64 letters (A–Z), digits, underscores or hyphens")
+        name = name.strip()
+        with self.lock:
+            account = self.accounts.get(name)
+            if account is None:
+                status, data = self.middle.request("POST", "/api/accounts/" + name, self.account_seed)
+                if status != 201 and not (status == 409 and data.get("error", {}).get("code") == "account_exists"):
+                    raise GatewayError(502, "account_unavailable", "Could not open the simulation account")
+                account = self.accounts[name] = Gateway(self.ai, self.middle, name)
+            now = monotonic()
+            self.sessions = {token: record for token, record in self.sessions.items() if record[0] > now}
+            self.sessions.pop(previous_token, None)
+            token = token_urlsafe(32)
+            self.sessions[token] = now + SESSION_TTL, account
+        return token, account
+
+    def current(self, token):
+        with self.lock:
+            record = self.sessions.get(token)
+            if record is not None and record[0] > monotonic():
+                return record[1]
+            self.sessions.pop(token, None)
+        return None
+
+    def sign_out(self, token):
+        with self.lock:
+            self.sessions.pop(token, None)
+
+
+class Gateway:
+    def __init__(self, ai, middle, user_id):
+        self.ai, self.middle, self.user_id = ai, middle, user_id
+        self.account_path = "/api/accounts/" + user_id
+        self.profile_path = "/v1/profiles/" + user_id
+        self.profile_lock = Lock()
+        self.synced_assessment = None
+        self.preview_lock = Lock()
+        self.previews = {}
 
     def _sync_profile(self, assessment):
         try:
@@ -154,8 +195,6 @@ class Gateway:
             params = parse_qs(url.query, keep_blank_values=True, max_num_fields=16)
         except ValueError as error:
             raise GatewayError(400, "invalid_query", "Too many query parameters") from error
-        if path == "/api/health" and method == "GET":
-            return self._health()
         if path == "/api/questionnaire" and method == "GET":
             return 200, public_bank()
         if path == "/api/questionnaire" and method == "POST":

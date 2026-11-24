@@ -1,6 +1,7 @@
 (() => {
   "use strict";
-  if (document.body.dataset.integrated !== "true") return;
+  const accountName = document.body.dataset.accountName;
+  if (!accountName) return;
 
   const find = (selector) => document.querySelector(selector);
   const label = (zh, en) => document.documentElement.lang === "en" ? en : zh;
@@ -25,12 +26,18 @@
   let changes = 0;
   const answers = new Map();
 
+  async function request(path, options = {}) {
+    const response = await fetch(path, { ...options, headers: { ...options.headers, "X-Harbor-Account": accountName } });
+    if (response.status === 401) location.reload();
+    return response;
+  }
+
   async function loadBank() {
     if (bank || loading) return;
     loading = true;
     status.textContent = label("正在读取问卷…", "Loading questionnaire…");
     try {
-      const response = await fetch("/api/questionnaire");
+      const response = await request("/api/questionnaire");
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       bank = await response.json();
       render();
@@ -102,7 +109,7 @@
     form.querySelectorAll("button, input").forEach((control) => { control.disabled = true; });
     status.textContent = label("正在评分和同步…", "Scoring and syncing…");
     try {
-      const response = await fetch("/api/questionnaire", {
+      const response = await request("/api/questionnaire", {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
           questionnaire_version: bank.questionnaire_version,
           answers: bank.questions.map(({ id }) => ({ qid: id, value: answers.get(id) })),
@@ -175,10 +182,13 @@
   nav.addEventListener("click", () => { if (bank) render(); else loadBank(); });
   document.addEventListener("harbor-language", localize);
   localize();
-  fetch("/api/profile").then(async (response) => {
+  request("/api/profile").then(async (response) => {
     if (response.ok) {
       const profile = await response.json();
-      if (profile.assessment) result = profile;
+      if (profile.assessment) {
+        result = profile;
+        if (!screen.hidden) render();
+      }
     } else if (response.status === 404 && !find("#screen-compare").hidden) {
       nav.click();
     }

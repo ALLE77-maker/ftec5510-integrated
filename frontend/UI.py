@@ -9,11 +9,12 @@ import os
 import re
 import threading
 import webbrowser
+from http.cookies import CookieError, SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from bff import Gateway, GatewayError, JsonService, MAX_BODY
+from bff import DemoSessions, GatewayError, JsonService, MAX_BODY, SESSION_TTL
 
 
 ROOT = Path(__file__).resolve().parent
@@ -58,6 +59,18 @@ class IntegratedHandler(PreviewHandler):
         if host not in allowed_hosts or origin not in {None, f"http://{host}"}:
             raise GatewayError(403, "local_only", "Use the local demo from its own origin")
 
+    @property
+    def _cookie_name(self):
+        return f"harbor_demo_session_{self.server.server_port}"
+
+    def _session_token(self):
+        try:
+            cookies = SimpleCookie(self.headers.get("Cookie", ""))
+        except CookieError:
+            return None
+        session = cookies.get(self._cookie_name)
+        return session.value if session else None
+
     def send_head(self):
         try:
             self._check_origin()
@@ -67,7 +80,10 @@ class IntegratedHandler(PreviewHandler):
         path = urlsplit(self.path).path
         if path not in {"/", "/index.html"}:
             return super().send_head()
-        html = (ROOT / "index.html").read_bytes().replace(b'<body>', b'<body data-integrated="true">', 1)
+        account = self.server.sessions.current(self._session_token())
+        account_attr = f' data-account-name="{account.user_id}"' if account else ""
+        body_tag = f'<body data-integrated="true"{account_attr}>'.encode("ascii")
+        html = (ROOT / "index.html").read_bytes().replace(b"<body>", body_tag, 1)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(html)))
@@ -94,10 +110,12 @@ class IntegratedHandler(PreviewHandler):
             raise GatewayError(400, "invalid_json", "Use a finite JSON object") from error
 
     def _api(self):
+        cookie = None
         try:
             self._check_origin()
+            url = urlsplit(self.path)
             body = self._read_json() if self.command in {"POST", "PUT"} else None
-            status, payload = self.server.gateway.dispatch(self.command, urlsplit(self.path), body)
+            status, payload, cookie = self._dispatch_api(url, body)
         except GatewayError as error:
             status, payload = error.status, error.payload
         except TimeoutError:
@@ -107,10 +125,36 @@ class IntegratedHandler(PreviewHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(result)))
+            if cookie is not None:
+                value, max_age = cookie
+                self.send_header("Set-Cookie", f"{self._cookie_name}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}")
             self.end_headers()
             self.wfile.write(result)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def _dispatch_api(self, url, body):
+        sessions = self.server.sessions
+        method, path = self.command, url.path
+        if (method, path) == ("GET", "/api/health"):
+            return (*sessions.health(), None)
+        token = self._session_token()
+        if (method, path) == ("POST", "/api/session"):
+            new_token, account = sessions.sign_in(body, token)
+            return 200, {"account_name": account.user_id}, (new_token, SESSION_TTL)
+        account = sessions.current(token)
+        expected = self.headers.get("X-Harbor-Account")
+        if expected is not None and (account is None or expected != account.user_id):
+            raise GatewayError(401, "session_changed", "The simulation account has changed; reload to continue")
+        if path == "/api/session":
+            if method == "GET":
+                return 200, {"account_name": account.user_id if account else None}, None
+            if method == "DELETE":
+                sessions.sign_out(token)
+                return 200, {"account_name": None}, ("", 0)
+        if account is None:
+            raise GatewayError(401, "sign_in_required", "Sign in to a simulation account first")
+        return (*account.dispatch(method, url, body), None)
 
     def do_GET(self):
         if self.path.startswith("/api/"):
@@ -118,17 +162,17 @@ class IntegratedHandler(PreviewHandler):
         else:
             super().do_GET()
 
-    do_POST = do_PUT = _api
+    do_POST = do_PUT = do_DELETE = _api
 
 
-def create_server(gateway=None, *, port=None):
+def create_server(sessions=None, *, port=None):
     ports = (port,) if port is not None else range(PREFERRED_PORT, PREFERRED_PORT + 20)
     last_error = None
     for candidate in ports:
         try:
-            handler = IntegratedHandler if gateway is not None else PreviewHandler
+            handler = IntegratedHandler if sessions is not None else PreviewHandler
             server = ThreadingHTTPServer((HOST, candidate), handler)
-            server.gateway = gateway
+            server.sessions = sessions
             return server, server.server_port
         except OSError as error:
             last_error = error
@@ -142,15 +186,15 @@ def main():
     parser.add_argument("--port", type=int)
     args = parser.parse_args()
 
-    gateway = None
+    sessions = None
     if args.integrated:
         try:
             ai = JsonService("ai", os.getenv("HARBOR_AI_URL", "http://127.0.0.1:8000"), os.environ["AI_MVP_API_TOKEN"], timeout=450)
             middle = JsonService("middle_office", os.getenv("HARBOR_MIDDLE_URL", "http://127.0.0.1:8200"), os.environ["MO_API_TOKEN"])
-            gateway = Gateway(ai, middle, os.environ["HARBOR_DEMO_USER"])
+            sessions = DemoSessions(ai, middle)
         except (KeyError, ValueError) as error:
             parser.error(f"invalid integrated configuration: {error}")
-    server, port = create_server(gateway, port=args.port)
+    server, port = create_server(sessions, port=args.port)
     url = f"http://{HOST}:{port}/index.html"
 
     if not args.no_browser:

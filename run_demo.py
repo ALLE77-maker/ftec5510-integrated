@@ -15,7 +15,7 @@ for module in ("frontend", "middle-office", "ai"):
     sys.path.insert(0, str(ROOT / module))
 
 from UI import create_server
-from bff import Gateway, JsonService
+from bff import DemoSessions, JsonService
 from ai_mvp.assistant import Assistant
 from ai_mvp.models import from_environment, remote_from_environment
 from ai_mvp.profiles import ProfileStore
@@ -28,7 +28,6 @@ from middle_office.validation import iso
 
 
 HOST = "127.0.0.1"
-USER = "student_demo"
 ASSESSMENT = {
     "questionnaire_version": "1.0.0",
     "source": "questionnaire",
@@ -77,10 +76,10 @@ def demo_stack(*, ui_port=None, ollama_model=None, enable_deepseek=False, live_m
         middle_url = start_server(resources, server)
         middle = JsonService("middle_office", middle_url, operator)
         reader_client = JsonService("middle_office", middle_url, reader)
-        office.create_account(USER, {
+        account_seed = {
             "initial_balances": {"USDT": "10000"},
             "initial_positions": [{"symbol": "BTC/USDT", "quantity": "0.1", "average_cost": "65000"}],
-        })
+        }
         if live_market:
             feed = server.public_feed = PublicMarketFeed(office)
             feed.start()
@@ -99,10 +98,9 @@ def demo_stack(*, ui_port=None, ollama_model=None, enable_deepseek=False, live_m
         )
         ai_url = start_server(resources, ApiServer(0, assistant, ai_token))
         ai = JsonService("ai", ai_url, ai_token, timeout=450 if ollama_model or enable_deepseek else 8)
-        ui, _ = create_server(Gateway(ai, middle, USER), port=ui_port)
+        ui, _ = create_server(DemoSessions(ai, middle, account_seed=account_seed), port=ui_port)
         ui_url = start_server(resources, ui)
-        browser = JsonService("frontend", ui_url, timeout=460 if ollama_model or enable_deepseek else 12)
-        yield browser, middle, ai, reader_client, ui_url
+        yield middle, ai, reader_client, ui_url
 
 
 def start_demo_feed(resources, office):
